@@ -15,7 +15,7 @@ pub enum EngineError {
     OpenFile {
         path: PathBuf,
         #[source]
-        source: io::Error,
+        file_error: io::Error,
     },
     #[error("I/O error: {0}")]
     Io(#[from] io::Error),
@@ -104,7 +104,11 @@ pub struct Engine {
 }
 
 impl Engine {
-    pub fn process_reader<R: Read>(&mut self, reader: R) -> Result<(), EngineError> {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn apply_transactions<R: Read>(&mut self, reader: R) -> Result<(), EngineError> {
         let mut csv_reader = csv::ReaderBuilder::new()
             .trim(csv::Trim::All)
             .flexible(true)
@@ -118,6 +122,14 @@ impl Engine {
         }
 
         Ok(())
+    }
+
+    pub fn apply_transactions_from_file(&mut self, path: PathBuf) -> Result<(), EngineError> {
+        let file = File::open(path.as_ref()).map_err(|error| EngineError::OpenFile {
+            path,
+            file_error: error,
+        })?;
+        self.apply_transactions(file)
     }
 
     pub fn write_accounts<W: Write>(&self, writer: W) -> Result<(), EngineError> {
@@ -295,20 +307,6 @@ impl Engine {
 
 fn format_decimal(value: Decimal) -> String {
     format!("{:.4}", value.round_dp(4))
-}
-
-pub fn run_from_reader<R: Read, W: Write>(reader: R, writer: W) -> Result<(), EngineError> {
-    let mut engine = Engine::default();
-    engine.process_reader(reader)?;
-    engine.write_accounts(writer)
-}
-
-pub fn run_from_path<P: AsRef<Path>>(path: P) -> Result<(), EngineError> {
-    let file = File::open(path.as_ref()).map_err(|source| EngineError::OpenFile {
-        path: path.as_ref().to_path_buf(),
-        source,
-    })?;
-    run_from_reader(file, io::stdout())
 }
 
 #[cfg(test)]
