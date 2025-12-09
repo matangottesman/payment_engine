@@ -1,11 +1,45 @@
+use std::{
+    collections::HashMap,
+    fs::File,
+    io::{self, Read, Write},
+    path::PathBuf,
+};
+
 use rust_decimal::Decimal;
 use serde::Deserialize;
-use std::collections::HashMap;
-use std::fs::File;
-use std::io::{self, Read, Write};
-use std::path::{Path, PathBuf};
 use thiserror::Error;
 use tracing::warn;
+
+type ClientId = u16;
+type TransactionId = u32;
+
+#[derive(Default)]
+pub struct Engine {
+    accounts: HashMap<ClientId, Account>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct Account {
+    available: Decimal,
+    held: Decimal,
+    locked: bool,
+    transactions: HashMap<TransactionId, Transaction>,
+}
+
+#[derive(Debug, Clone)]
+enum Transaction {
+    Deposit { amount: Decimal, state: TransactionState },
+    // Based on spec wording, assuming that withdrawals cannot be disputed.
+    Withdrawal { amount: Decimal },
+}
+
+#[derive(Debug, Clone)]
+enum TransactionState {
+    Normal,
+    Disputed,
+    Resolved,
+    ChargedBack,
+}
 
 #[derive(Debug, Error)]
 pub enum EngineError {
@@ -22,58 +56,27 @@ pub enum EngineError {
 }
 
 #[derive(Debug, Deserialize)]
-struct RawRecord {
-    #[serde(rename = "type")]
-    kind: String,
-    client: u16,
-    tx: u32,
-    amount: Option<Decimal>,
+#[serde(tag = "type")]
+#[serde(rename_all = "lowercase")]
+enum InputTransaction {
+    Deposit(InputFundTransaction),
+    Withdrawal(InputFundTransaction),
+    Dispute(InputDepositAlterTransaction),
+    Resolve(InputDepositAlterTransaction),
+    Chargeback(InputDepositAlterTransaction),
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum TxType {
-    Deposit,
-    Withdrawal,
-    Dispute,
-    Resolve,
-    Chargeback,
+#[derive(Debug, Deserialize)]
+struct InputFundTransaction {
+    client: ClientId,
+    tx: TransactionId,
+    amount: Decimal,
 }
 
-impl TxType {
-    fn from_str(value: &str) -> Option<Self> {
-        match value.trim().to_lowercase().as_str() {
-            "deposit" => Some(Self::Deposit),
-            "withdrawal" => Some(Self::Withdrawal),
-            "dispute" => Some(Self::Dispute),
-            "resolve" => Some(Self::Resolve),
-            "chargeback" => Some(Self::Chargeback),
-            _ => None,
-        }
-    }
-}
-
-#[derive(Debug)]
-struct TransactionInput {
-    client: u16,
-    tx: u32,
-    amount: Option<Decimal>,
-}
-
-#[derive(Debug, Clone)]
-struct Account {
-    available: Decimal,
-    held: Decimal,
-    locked: bool,
-}
-
-impl Default for Account {
-    fn default() -> Self {
-        Self {
-            available: Decimal::ZERO,
-            held: Decimal::ZERO,
-            locked: false,
-        }
-    }
+#[derive(Debug, Deserialize)]
+struct InputDepositAlterTransaction {
+    client: ClientId,
+    tx: TransactionId,
 }
 
 impl Account {
@@ -82,29 +85,8 @@ impl Account {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum PostedKind {
-    Deposit,
-    Withdrawal,
-}
-
-#[derive(Debug, Clone)]
-struct StoredTransaction {
-    client: u16,
-    amount: Decimal,
-    kind: PostedKind,
-    disputed: bool,
-    charged_back: bool,
-}
-
-#[derive(Default)]
-pub struct Engine {
-    accounts: HashMap<u16, Account>,
-    transactions: HashMap<u32, StoredTransaction>,
-}
-
 impl Engine {
-    pub fn new() -> Self {
+    #[must_use] pub fn new() -> Self {
         Self::default()
     }
 
@@ -114,7 +96,7 @@ impl Engine {
             .flexible(true)
             .from_reader(reader);
 
-        for (row, record) in csv_reader.deserialize::<RawRecord>().enumerate() {
+        for (row, record) in csv_reader.deserialize::<InputTransaction>().enumerate() {
             match record {
                 Ok(raw) => self.process_record(raw),
                 Err(err) => warn!(row = row + 1, error = %err, "Skipping malformed row"),
@@ -125,7 +107,7 @@ impl Engine {
     }
 
     pub fn apply_transactions_from_file(&mut self, path: PathBuf) -> Result<(), EngineError> {
-        let file = File::open(path.as_ref()).map_err(|error| EngineError::OpenFile {
+        let file = File::open(&path).map_err(|error| EngineError::OpenFile {
             path,
             file_error: error,
         })?;
@@ -160,34 +142,19 @@ impl Engine {
         Ok(())
     }
 
-    fn process_record(&mut self, raw: RawRecord) {
-        let Some(kind) = TxType::from_str(&raw.kind) else {
-            warn!(tx = raw.tx, kind = raw.kind, "Unknown transaction type");
-            return;
-        };
-
-        let tx = TransactionInput {
-            client: raw.client,
-            tx: raw.tx,
-            amount: raw.amount,
-        };
-
-        match kind {
-            TxType::Deposit => self.deposit(tx),
-            TxType::Withdrawal => self.withdraw(tx),
-            TxType::Dispute => self.dispute(tx),
-            TxType::Resolve => self.resolve(tx),
-            TxType::Chargeback => self.chargeback(tx),
+    fn process_record(&mut self, input_transaction: InputTransaction) {
+        match input_transaction {
+            InputTransaction::Deposit(tx) => self.deposit(tx),
+            InputTransaction::Withdrawal(tx) => self.withdraw(tx),
+            InputTransaction::Dispute(tx) => self.dispute(tx),
+            InputTransaction::Resolve(tx) => self.resolve(tx),
+            InputTransaction::Chargeback(tx) => self.chargeback(tx),
         }
     }
 
-    fn deposit(&mut self, tx: TransactionInput) {
-        let Some(amount) = tx.amount else {
-            warn!(tx = tx.tx, "Deposit missing amount");
-            return;
-        };
-
-        if self.transactions.contains_key(&tx.tx) {
+    fn deposit(&mut self, tx: InputFundTransaction) {
+        let account = self.accounts.entry(tx.client).or_default();
+        if account.transactions.contains_key(&tx.tx) {
             warn!(tx = tx.tx, "Duplicate transaction id ignored");
             return;
         }
@@ -197,26 +164,20 @@ impl Engine {
             return;
         }
 
+        let amount = tx.amount;
         account.available += amount;
-        self.transactions.insert(
+        account.transactions.insert(
             tx.tx,
-            StoredTransaction {
-                client: tx.client,
+            Transaction::Deposit {
                 amount,
-                kind: PostedKind::Deposit,
-                disputed: false,
-                charged_back: false,
+                state: TransactionState::Normal,
             },
         );
     }
 
-    fn withdraw(&mut self, tx: TransactionInput) {
-        let Some(amount) = tx.amount else {
-            warn!(tx = tx.tx, "Withdrawal missing amount");
-            return;
-        };
-
-        if self.transactions.contains_key(&tx.tx) {
+    fn withdraw(&mut self, tx: InputFundTransaction) {
+        let account = self.accounts.entry(tx.client).or_default();
+        if account.transactions.contains_key(&tx.tx) {
             warn!(tx = tx.tx, "Duplicate transaction id ignored");
             return;
         }
@@ -226,82 +187,85 @@ impl Engine {
             return;
         }
 
+        let amount = tx.amount;
         if account.available < amount {
             return;
         }
 
         account.available -= amount;
-        self.transactions.insert(
-            tx.tx,
-            StoredTransaction {
-                client: tx.client,
-                amount,
-                kind: PostedKind::Withdrawal,
-                disputed: false,
-                charged_back: false,
-            },
-        );
+        account.transactions.insert(tx.tx, Transaction::Withdrawal { amount });
     }
 
-    fn dispute(&mut self, tx: TransactionInput) {
-        let Some(stored) = self.transactions.get_mut(&tx.tx) else {
+    fn dispute(&mut self, input_tx: InputDepositAlterTransaction) {
+        let Some(account) = self.accounts.get_mut(&input_tx.client) else {
+            // Client doesn't exist
             return;
         };
-        if stored.client != tx.client || stored.kind != PostedKind::Deposit || stored.disputed {
-            return;
-        }
 
-        let Some(account) = self.accounts.get_mut(&tx.client) else {
+        let Some(stored_tx) = account.transactions.get_mut(&input_tx.tx) else {
             return;
         };
+
+        let Transaction::Deposit { amount, state } = stored_tx else {
+            // Withdrawals cannot be disputed
+            return;
+        };
+
         if account.locked {
             return;
         }
 
-        account.available -= stored.amount;
-        account.held += stored.amount;
-        stored.disputed = true;
+        account.available -= *amount;
+        account.held += *amount;
+        *state = TransactionState::Disputed;
     }
 
-    fn resolve(&mut self, tx: TransactionInput) {
-        let Some(stored) = self.transactions.get_mut(&tx.tx) else {
+    fn resolve(&mut self, input_tx: InputDepositAlterTransaction) {
+        let Some(account) = self.accounts.get_mut(&input_tx.client) else {
+            // Client doesn't exist
             return;
         };
-        if stored.client != tx.client || stored.kind != PostedKind::Deposit || !stored.disputed || stored.charged_back {
-            return;
-        }
 
-        let Some(account) = self.accounts.get_mut(&tx.client) else {
+        let Some(stored_tx) = account.transactions.get_mut(&input_tx.tx) else {
             return;
         };
+
+        let Transaction::Deposit { amount, state } = stored_tx else {
+            // Withdrawals cannot be disputed
+            return;
+        };
+
         if account.locked {
             return;
         }
 
-        account.held -= stored.amount;
-        account.available += stored.amount;
-        stored.disputed = false;
+        account.held -= *amount;
+        account.available += *amount;
+        *state = TransactionState::Resolved;
     }
 
-    fn chargeback(&mut self, tx: TransactionInput) {
-        let Some(stored) = self.transactions.get_mut(&tx.tx) else {
+    fn chargeback(&mut self, input_tx: InputDepositAlterTransaction) {
+        let Some(account) = self.accounts.get_mut(&input_tx.client) else {
+            // Client doesn't exist
             return;
         };
-        if stored.client != tx.client || stored.kind != PostedKind::Deposit || !stored.disputed || stored.charged_back {
-            return;
-        }
 
-        let Some(account) = self.accounts.get_mut(&tx.client) else {
+        let Some(stored_tx) = account.transactions.get_mut(&input_tx.tx) else {
             return;
         };
+
+        let Transaction::Deposit { amount, state } = stored_tx else {
+            // Withdrawals cannot be disputed
+            return;
+        };
+
         if account.locked {
             return;
         }
 
-        account.held -= stored.amount;
+        account.held -= *amount;
         account.locked = true;
-        stored.disputed = false;
-        stored.charged_back = true;
+        *state = TransactionState::ChargedBack;
     }
 }
 
@@ -311,12 +275,14 @@ fn format_decimal(value: Decimal) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use rust_decimal::Decimal;
     use std::str::FromStr;
 
-    fn raw(kind: &str, client: u16, tx: u32, amount: Option<&str>) -> RawRecord {
-        RawRecord {
+    use rust_decimal::Decimal;
+
+    use super::*;
+
+    fn raw(kind: &str, client: u16, tx: u32, amount: Option<&str>) -> InputTransaction {
+        InputTransaction {
             kind: kind.to_string(),
             client,
             tx,

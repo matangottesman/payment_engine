@@ -1,7 +1,7 @@
-use std::io;
+use std::{io, path::PathBuf};
+
 use clap::Parser;
 use color_eyre::Result;
-use std::path::PathBuf;
 use payments_engine::Engine;
 
 #[derive(Debug, Parser)]
