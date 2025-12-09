@@ -1,0 +1,25 @@
+[package]
+name = "payments_engine"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+csv = "1.4.0"
+rust_decimal = { version = "1.39.0", features = ["serde"] }
+serde = { version = "1.0.228", features = ["derive"] }
+clap = { version = "4.5.53", features = ["derive"] }
+color-eyre = "0.6.5"
+thiserror = "2.0.17"
+tracing = "0.1.43"
+tracing-subscriber = { version = "0.3.22", features = ["env-filter"] }
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+all = { level = "deny", priority = -1 }
+pedantic = { level = "deny", priority = -1 }
+nursery = { level = "deny", priority = -1 }
+unwrap_used = "deny"
+
+module_name_repetitions = "allow"
