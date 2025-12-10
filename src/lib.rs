@@ -47,6 +47,8 @@ struct Withdrawal {
 enum TransactionState {
     Normal,
     Disputed,
+    // Assume that funds cannot be disputed more than once. Would be odd for a bank to allow a customer to dispute
+    // the same charge after resolving. So we'll mark resolved transactions so that they can't be disputed again.
     Resolved,
     ChargedBack,
 }

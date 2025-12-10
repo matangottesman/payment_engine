@@ -15,7 +15,7 @@ fn main() -> Result<()> {
     // Write errors to std::error. I don't want to assume that I can open a file for logging
     tracing_subscriber::fmt()
         .with_target(false)
-        .with_writer(std::io::stderr)
+        .with_writer(io::stderr)
         .init();
 
     let cli = Cli::parse();
