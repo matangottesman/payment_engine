@@ -111,10 +111,22 @@ impl Engine {
             .has_headers(true)
             .from_reader(reader);
         for (line, record) in csv_reader.deserialize::<RawInputTransaction>().enumerate() {
-            match record {
-                Ok(raw) => self.process_record(raw.try_into()?),
-                Err(err) => warn!(line, error = %err, "Skipping malformed row"),
-            }
+            let raw_input = match record {
+                Ok(r) => r,
+                Err(err) => {
+                    warn!(line, error = %err, "Skipping malformed transaction row");
+                    continue;
+                }
+            };
+            let input = match raw_input.try_into() {
+                Ok(tx) => tx,
+                Err(err) => {
+                    warn!(line, error = %err, "Skipping invalid transaction conversion from raw input");
+                    continue;
+                }
+            };
+
+            self.process_record(input);
         }
 
         Ok(())
