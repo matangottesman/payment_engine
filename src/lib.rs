@@ -319,23 +319,14 @@ mod tests {
 
     use super::*;
 
-    fn raw(kind: &str, client: u16, tx: u32, amount: Option<&str>) -> InputTransaction {
-        InputTransaction {
-            kind: kind.to_string(),
-            client,
-            tx,
-            amount: amount.map(|v| Decimal::from_str(v).unwrap()),
-        }
-    }
-
     #[test]
     fn deposit_and_withdraw() {
         let mut engine = Engine::default();
-        engine.process_record(raw("deposit", 1, 1, Some("1.0")));
+        engine.process_record(raw("deposit", 1, 1, Some("1.24")));
         engine.process_record(raw("withdrawal", 1, 2, Some("0.5")));
 
         let account = engine.accounts.get(&1).unwrap();
-        assert_eq!(account.available, Decimal::new(5, 1));
+        assert_eq!(account.available, Decimal::from_str("0.74").unwrap());
         assert_eq!(account.held, Decimal::ZERO);
         assert!(!account.locked);
     }
@@ -344,11 +335,12 @@ mod tests {
     fn dispute_and_resolve_cycle() {
         let mut engine = Engine::default();
         engine.process_record(raw("deposit", 1, 1, Some("2.0")));
+        engine.process_record(raw("deposit", 1, 2, Some("1.0")));
         engine.process_record(raw("dispute", 1, 1, None));
         engine.process_record(raw("resolve", 1, 1, None));
 
         let account = engine.accounts.get(&1).unwrap();
-        assert_eq!(account.available, Decimal::new(20, 1));
+        assert_eq!(account.available, Decimal::from_str("3.0").unwrap());
         assert_eq!(account.held, Decimal::ZERO);
         assert!(!account.locked);
     }
@@ -358,35 +350,181 @@ mod tests {
         let mut engine = Engine::default();
         engine.process_record(raw("deposit", 1, 1, Some("3.5")));
         engine.process_record(raw("dispute", 1, 1, None));
+        engine.process_record(raw("deposit", 1, 2, Some("5.0")));
         engine.process_record(raw("chargeback", 1, 1, None));
-        engine.process_record(raw("deposit", 1, 2, Some("1.0")));
+        engine.process_record(raw("deposit", 1, 3, Some("1.0")));
+
+        let account = engine.accounts.get(&1).unwrap();
+        assert_eq!(account.available, Decimal::from_str("5.0").unwrap());
+        assert_eq!(account.held, Decimal::ZERO);
+        assert!(account.locked);
+    }
+
+    #[test]
+    fn withdrawal_before_any_deposit_is_ignored() {
+        let mut engine = Engine::default();
+        engine.process_record(raw("withdrawal", 1, 1, Some("1.0")));
 
         let account = engine.accounts.get(&1).unwrap();
         assert_eq!(account.available, Decimal::ZERO);
         assert_eq!(account.held, Decimal::ZERO);
-        assert!(account.locked);
+        assert!(account.transactions.is_empty());
     }
 
     #[test]
     fn skips_insufficient_withdrawal() {
         let mut engine = Engine::default();
         engine.process_record(raw("deposit", 1, 1, Some("1.0")));
-        engine.process_record(raw("withdrawal", 1, 2, Some("2.0")));
+        engine.process_record(raw("deposit", 1, 3, Some("1.0")));
+        engine.process_record(raw("withdrawal", 1, 2, Some("2.01")));
 
         let account = engine.accounts.get(&1).unwrap();
-        assert_eq!(account.available, Decimal::new(10, 1));
+        assert_eq!(account.available, Decimal::from_str("2.0").unwrap());
     }
 
     #[test]
-    fn writes_csv_output() {
+    fn withdrawal_does_not_use_held_funds() {
         let mut engine = Engine::default();
-        engine.process_record(raw("deposit", 2, 1, Some("1.2")));
+        engine.process_record(raw("deposit", 1, 1, Some("5.0")));
+        engine.process_record(raw("deposit", 1, 5, Some("2.0")));
+        engine.process_record(raw("dispute", 1, 1, None));
+        engine.process_record(raw("withdrawal", 1, 2, Some("3.0")));
 
-        let mut buffer = Vec::new();
-        engine.write_accounts(&mut buffer).unwrap();
+        let account = engine.accounts.get(&1).unwrap();
+        assert_eq!(account.available, Decimal::from_str("2.0").unwrap());
+        assert_eq!(account.held, Decimal::from_str("5.0").unwrap());
+        assert!(!account.locked);
+    }
 
-        let output = String::from_utf8(buffer).unwrap();
-        assert!(output.contains("client,available,held,total,locked"));
-        assert!(output.contains("2,1.2000,0.0000,1.2000,false"));
+    #[test]
+    fn disputing_already_disputed_transaction_is_ignored() {
+        let mut engine = Engine::default();
+        engine.process_record(raw("deposit", 1, 1, Some("2.0")));
+        engine.process_record(raw("dispute", 1, 1, None));
+        engine.process_record(raw("dispute", 1, 1, None));
+
+        let account = engine.accounts.get(&1).unwrap();
+        assert_eq!(account.available, Decimal::ZERO);
+        assert_eq!(account.held, Decimal::from_str("2.0").unwrap());
+        let Transaction::Deposit(deposit) = account.transactions.get(&1).unwrap() else {
+            panic!("expected deposit transaction");
+        };
+        assert!(matches!(deposit.state, TransactionState::Disputed));
+    }
+
+    #[test]
+    fn resolve_not_in_dispute_is_ignored() {
+        let mut engine = Engine::default();
+        engine.process_record(raw("deposit", 1, 1, Some("2.0")));
+        engine.process_record(raw("resolve", 1, 1, None));
+
+        let account = engine.accounts.get(&1).unwrap();
+        assert_eq!(account.available, Decimal::from_str("2.0").unwrap());
+        assert_eq!(account.held, Decimal::ZERO);
+        let Transaction::Deposit(deposit) = account.transactions.get(&1).unwrap() else {
+            panic!("expected deposit transaction");
+        };
+        assert!(matches!(deposit.state, TransactionState::Normal));
+    }
+
+    #[test]
+    fn chargeback_not_in_dispute_is_ignored() {
+        let mut engine = Engine::default();
+        engine.process_record(raw("deposit", 1, 1, Some("2.0")));
+        engine.process_record(raw("chargeback", 1, 1, None));
+
+        let account = engine.accounts.get(&1).unwrap();
+        assert_eq!(account.available, Decimal::from_str("2.0").unwrap());
+        assert_eq!(account.held, Decimal::ZERO);
+        assert!(!account.locked);
+        let Transaction::Deposit(deposit) = account.transactions.get(&1).unwrap() else {
+            panic!("expected deposit transaction");
+        };
+        assert!(matches!(deposit.state, TransactionState::Normal));
+    }
+
+    #[test]
+    fn dispute_or_resolution_on_withdrawal_is_ignored() {
+        let mut engine = Engine::default();
+        engine.process_record(raw("deposit", 1, 1, Some("2.0")));
+        engine.process_record(raw("withdrawal", 1, 2, Some("1.0")));
+        engine.process_record(raw("dispute", 1, 2, None));
+        engine.process_record(raw("resolve", 1, 2, None));
+        engine.process_record(raw("chargeback", 1, 2, None));
+
+        let account = engine.accounts.get(&1).unwrap();
+        assert_eq!(account.available, Decimal::from_str("1.0").unwrap());
+        assert_eq!(account.held, Decimal::ZERO);
+        assert!(!account.locked);
+        let Transaction::Withdrawal(withdrawal) = account.transactions.get(&2).unwrap() else {
+            panic!("expected withdrawal transaction");
+        };
+        assert_eq!(withdrawal.amount, Decimal::from_str("1.0").unwrap());
+    }
+
+    #[test]
+    fn dispute_or_resolution_on_missing_transaction_is_ignored() {
+        let mut engine = Engine::default();
+        engine.process_record(raw("deposit", 1, 1, Some("2.0")));
+        engine.process_record(raw("dispute", 1, 98, None));
+        engine.process_record(raw("resolve", 1, 99, None));
+        engine.process_record(raw("chargeback", 1, 99, None));
+
+        let account = engine.accounts.get(&1).unwrap();
+        assert_eq!(account.available, Decimal::from_str("2.0").unwrap());
+        assert_eq!(account.held, Decimal::ZERO);
+        assert!(!account.locked);
+        assert!(matches!(
+            account.transactions.get(&1),
+            Some(Transaction::Deposit(_))
+        ));
+    }
+
+    #[test]
+    fn all_transaction_types_are_ignored_on_locked_account() {
+        let mut engine = Engine::default();
+        engine.process_record(raw("deposit", 1, 1, Some("3.0")));
+        engine.process_record(raw("dispute", 1, 1, None));
+        engine.process_record(raw("chargeback", 1, 1, None));
+
+        engine.process_record(raw("deposit", 1, 2, Some("1.0")));
+        engine.process_record(raw("withdrawal", 1, 3, Some("1.0")));
+        engine.process_record(raw("dispute", 1, 1, None));
+        engine.process_record(raw("resolve", 1, 1, None));
+        engine.process_record(raw("chargeback", 1, 1, None));
+
+        let account = engine.accounts.get(&1).unwrap();
+        assert_eq!(account.available, Decimal::ZERO);
+        assert_eq!(account.held, Decimal::ZERO);
+        assert!(account.locked);
+        assert_eq!(account.transactions.len(), 1);
+        let Transaction::Deposit(deposit) = account.transactions.get(&1).unwrap() else {
+            panic!("expected deposit transaction");
+        };
+        assert!(matches!(deposit.state, TransactionState::ChargedBack));
+    }
+
+    #[test]
+    fn duplicate_transactions_ids_ignored() {
+        let mut engine = Engine::default();
+        engine.process_record(raw("deposit", 1, 1, Some("1.24")));
+        engine.process_record(raw("withdrawal", 1, 2, Some("0.5")));
+        engine.process_record(raw("deposit", 1, 2, Some("5")));
+
+        let account = engine.accounts.get(&1).unwrap();
+        assert_eq!(account.available, Decimal::from_str("0.74").unwrap());
+        assert_eq!(account.held, Decimal::ZERO);
+        assert!(!account.locked);
+    }
+
+    fn raw(kind: &str, client: ClientId, tx: TransactionId, amount: Option<&str>) -> InputTransaction {
+        RawInputTransaction {
+            tx_type: kind.to_string(),
+            client,
+            tx,
+            amount: amount.map(|v| Decimal::from_str(v).expect("Incorrect decimal string")),
+        }
+            .try_into()
+            .expect("Raw transaction failed to convert into InputTransaction")
     }
 }
