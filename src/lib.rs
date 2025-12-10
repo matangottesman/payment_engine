@@ -4,7 +4,7 @@ use std::{
     io::{self, Read, Write},
     path::PathBuf,
 };
-
+use std::collections::HashSet;
 use rust_decimal::Decimal;
 use serde::Deserialize;
 use thiserror::Error;
@@ -16,6 +16,7 @@ type TransactionId = u32;
 #[derive(Default)]
 pub struct Engine {
     accounts: HashMap<ClientId, Account>,
+    transaction_ids_processed: HashSet<TransactionId>,
 }
 
 #[derive(Default)]
@@ -163,15 +164,9 @@ impl Engine {
     }
 
     fn deposit(&mut self, client_id: ClientId, tx_id: TransactionId, amount: Decimal) {
-        let account = self.accounts.entry(client_id).or_default();
-        if account.locked {
+        let Some(account) = self.get_unlocked_account_or_default(client_id, tx_id) else {
             return;
-        }
-
-        // This doesn't handle duplicate transactions across clients, but that scenario isn't described
-        if account.transactions.contains_key(&tx_id) {
-            return;
-        }
+        };
 
         account.available += amount;
         account.transactions.insert(
@@ -181,16 +176,13 @@ impl Engine {
                 state: TransactionState::Normal,
             }),
         );
+        self.transaction_ids_processed.insert(tx_id);
     }
 
     fn withdraw(&mut self, client_id: ClientId, tx_id: TransactionId, amount: Decimal) {
-        let Some(account) = self.get_unlocked_account(client_id) else {
+        let Some(account) = self.get_unlocked_account_or_default(client_id, tx_id) else {
             return;
         };
-
-        if account.transactions.contains_key(&tx_id) {
-            return;
-        }
 
         if account.available < amount {
             return;
@@ -200,6 +192,7 @@ impl Engine {
         account
             .transactions
             .insert(tx_id, Transaction::Withdrawal(Withdrawal { amount }));
+        self.transaction_ids_processed.insert(tx_id);
     }
 
     fn dispute(&mut self, client_id: ClientId, tx_id: TransactionId) {
@@ -253,6 +246,17 @@ impl Engine {
         account.held -= deposit.amount;
         account.locked = true;
         deposit.state = TransactionState::ChargedBack;
+    }
+
+    fn get_unlocked_account_or_default(&mut self, client_id: ClientId, tx_id: TransactionId) -> Option<&mut Account> {
+        let account = self.accounts.entry(client_id).or_default();
+        if account.locked {
+            return None;
+        }
+        if self.transaction_ids_processed.contains(&tx_id) {
+            return None;
+        }
+        Some(account)
     }
 
     fn get_unlocked_account(&mut self, client_id: ClientId) -> Option<&mut Account> {
