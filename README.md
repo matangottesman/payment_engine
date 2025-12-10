@@ -62,4 +62,4 @@ Unit tests and a full end-to-end test using the provided `tests/sample_transacti
 
 ```cargo +nightly fmt```
 
-```cargo clippy --fix --allow-dirty --allow-staged```
+```cargo clippy --fix```
