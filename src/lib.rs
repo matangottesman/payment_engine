@@ -8,7 +8,7 @@ use std::{
 use rust_decimal::Decimal;
 use serde::Deserialize;
 use thiserror::Error;
-use tracing::warn;
+use tracing::{error, warn};
 
 type ClientId = u16;
 type TransactionId = u32;
@@ -18,7 +18,7 @@ pub struct Engine {
     accounts: HashMap<ClientId, Account>,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Default)]
 struct Account {
     available: Decimal,
     held: Decimal,
@@ -26,11 +26,20 @@ struct Account {
     transactions: HashMap<TransactionId, Transaction>,
 }
 
-#[derive(Debug, Clone)]
 enum Transaction {
-    Deposit { amount: Decimal, state: TransactionState },
-    // Based on spec wording, assuming that withdrawals cannot be disputed.
-    Withdrawal { amount: Decimal },
+    Deposit(Deposit),
+    Withdrawal(Withdrawal),
+}
+
+struct Deposit {
+    amount: Decimal,
+    state: TransactionState,
+}
+
+// Based on spec wording, assuming that withdrawals cannot be disputed, and therefore don't require
+// a state.
+struct Withdrawal {
+    amount: Decimal,
 }
 
 #[derive(Debug, Clone)]
@@ -53,30 +62,33 @@ pub enum EngineError {
     },
     #[error("I/O error: {0}")]
     Io(#[from] io::Error),
+
+    #[error("input transaction validation error: {0}")]
+    InputValidation(String),
 }
 
-#[derive(Debug, Deserialize)]
-#[serde(tag = "type")]
-#[serde(rename_all = "lowercase")]
+#[derive(Debug)]
 enum InputTransaction {
-    Deposit(InputFundTransaction),
-    Withdrawal(InputFundTransaction),
-    Dispute(InputDepositAlterTransaction),
-    Resolve(InputDepositAlterTransaction),
-    Chargeback(InputDepositAlterTransaction),
+    Deposit(TransactionIds, Decimal),
+    Withdrawal(TransactionIds, Decimal),
+    Dispute(TransactionIds),
+    Resolve(TransactionIds),
+    Chargeback(TransactionIds),
+}
+
+#[derive(Debug)]
+struct TransactionIds {
+    client: ClientId,
+    tx: TransactionId,
 }
 
 #[derive(Debug, Deserialize)]
-struct InputFundTransaction {
+struct RawInputTransaction {
+    #[serde(rename = "type")]
+    tx_type: String,
     client: ClientId,
     tx: TransactionId,
-    amount: Decimal,
-}
-
-#[derive(Debug, Deserialize)]
-struct InputDepositAlterTransaction {
-    client: ClientId,
-    tx: TransactionId,
+    amount: Option<Decimal>,
 }
 
 impl Account {
@@ -86,7 +98,8 @@ impl Account {
 }
 
 impl Engine {
-    #[must_use] pub fn new() -> Self {
+    #[must_use]
+    pub fn new() -> Self {
         Self::default()
     }
 
@@ -94,12 +107,12 @@ impl Engine {
         let mut csv_reader = csv::ReaderBuilder::new()
             .trim(csv::Trim::All)
             .flexible(true)
+            .has_headers(true)
             .from_reader(reader);
-
-        for (row, record) in csv_reader.deserialize::<InputTransaction>().enumerate() {
+        for (line, record) in csv_reader.deserialize::<RawInputTransaction>().enumerate() {
             match record {
-                Ok(raw) => self.process_record(raw),
-                Err(err) => warn!(row = row + 1, error = %err, "Skipping malformed row"),
+                Ok(raw) => self.process_record(raw.try_into()?),
+                Err(err) => warn!(line, error = %err, "Skipping malformed row"),
             }
         }
 
@@ -117,18 +130,15 @@ impl Engine {
     pub fn write_accounts<W: Write>(&self, writer: W) -> Result<(), EngineError> {
         #[derive(serde::Serialize)]
         struct AccountRow {
-            client: u16,
+            client: ClientId,
             available: String,
             held: String,
             total: String,
             locked: bool,
         }
 
-        let mut rows: Vec<_> = self.accounts.iter().collect();
-        rows.sort_by_key(|(client, _)| **client);
-
         let mut csv_writer = csv::Writer::from_writer(writer);
-        for (client, account) in rows {
+        for (client, account) in &self.accounts {
             let row = AccountRow {
                 client: *client,
                 available: format_decimal(account.available),
@@ -144,133 +154,145 @@ impl Engine {
 
     fn process_record(&mut self, input_transaction: InputTransaction) {
         match input_transaction {
-            InputTransaction::Deposit(tx) => self.deposit(tx),
-            InputTransaction::Withdrawal(tx) => self.withdraw(tx),
-            InputTransaction::Dispute(tx) => self.dispute(tx),
-            InputTransaction::Resolve(tx) => self.resolve(tx),
-            InputTransaction::Chargeback(tx) => self.chargeback(tx),
+            InputTransaction::Deposit(TransactionIds { client, tx }, amount) => self.deposit(client, tx, amount),
+            InputTransaction::Withdrawal(TransactionIds { client, tx }, amount) => self.withdraw(client, tx, amount),
+            InputTransaction::Dispute(TransactionIds { client, tx }) => self.dispute(client, tx),
+            InputTransaction::Resolve(TransactionIds { client, tx }) => self.resolve(client, tx),
+            InputTransaction::Chargeback(TransactionIds { client, tx }) => self.chargeback(client, tx),
         }
     }
 
-    fn deposit(&mut self, tx: InputFundTransaction) {
-        let account = self.accounts.entry(tx.client).or_default();
-        if account.transactions.contains_key(&tx.tx) {
-            warn!(tx = tx.tx, "Duplicate transaction id ignored");
-            return;
-        }
-
-        let account = self.accounts.entry(tx.client).or_default();
+    fn deposit(&mut self, client_id: ClientId, tx_id: TransactionId, amount: Decimal) {
+        let account = self.accounts.entry(client_id).or_default();
         if account.locked {
             return;
         }
 
-        let amount = tx.amount;
+        // This doesn't handle duplicate transactions across clients, but that scenario isn't described
+        if account.transactions.contains_key(&tx_id) {
+            return;
+        }
+
         account.available += amount;
         account.transactions.insert(
-            tx.tx,
-            Transaction::Deposit {
+            tx_id,
+            Transaction::Deposit(Deposit {
                 amount,
                 state: TransactionState::Normal,
-            },
+            }),
         );
     }
 
-    fn withdraw(&mut self, tx: InputFundTransaction) {
-        let account = self.accounts.entry(tx.client).or_default();
-        if account.transactions.contains_key(&tx.tx) {
-            warn!(tx = tx.tx, "Duplicate transaction id ignored");
+    fn withdraw(&mut self, client_id: ClientId, tx_id: TransactionId, amount: Decimal) {
+        let Some(account) = self.get_unlocked_account(client_id) else {
+            return;
+        };
+
+        if account.transactions.contains_key(&tx_id) {
             return;
         }
 
-        let account = self.accounts.entry(tx.client).or_default();
-        if account.locked {
-            return;
-        }
-
-        let amount = tx.amount;
         if account.available < amount {
             return;
         }
 
         account.available -= amount;
-        account.transactions.insert(tx.tx, Transaction::Withdrawal { amount });
+        account
+            .transactions
+            .insert(tx_id, Transaction::Withdrawal(Withdrawal { amount }));
     }
 
-    fn dispute(&mut self, input_tx: InputDepositAlterTransaction) {
-        let Some(account) = self.accounts.get_mut(&input_tx.client) else {
-            // Client doesn't exist
+    fn dispute(&mut self, client_id: ClientId, tx_id: TransactionId) {
+        let Some(account) = self.get_unlocked_account(client_id) else {
+            return;
+        };
+        let Some(Transaction::Deposit(deposit)) = account.transactions.get_mut(&tx_id) else {
             return;
         };
 
-        let Some(stored_tx) = account.transactions.get_mut(&input_tx.tx) else {
-            return;
-        };
-
-        let Transaction::Deposit { amount, state } = stored_tx else {
-            // Withdrawals cannot be disputed
-            return;
-        };
-
-        if account.locked {
+        if !matches!(deposit.state, TransactionState::Normal) {
             return;
         }
 
-        account.available -= *amount;
-        account.held += *amount;
-        *state = TransactionState::Disputed;
+        let amount = deposit.amount;
+        account.available -= amount;
+        account.held += amount;
+        deposit.state = TransactionState::Disputed;
     }
 
-    fn resolve(&mut self, input_tx: InputDepositAlterTransaction) {
-        let Some(account) = self.accounts.get_mut(&input_tx.client) else {
-            // Client doesn't exist
+    fn resolve(&mut self, client_id: ClientId, tx_id: TransactionId) {
+        let Some(account) = self.get_unlocked_account(client_id) else {
+            return;
+        };
+        let Some(Transaction::Deposit(deposit)) = account.transactions.get_mut(&tx_id) else {
             return;
         };
 
-        let Some(stored_tx) = account.transactions.get_mut(&input_tx.tx) else {
-            return;
-        };
-
-        let Transaction::Deposit { amount, state } = stored_tx else {
-            // Withdrawals cannot be disputed
-            return;
-        };
-
-        if account.locked {
+        if !matches!(deposit.state, TransactionState::Disputed) {
             return;
         }
 
-        account.held -= *amount;
-        account.available += *amount;
-        *state = TransactionState::Resolved;
+        let amount = deposit.amount;
+        account.held -= amount;
+        account.available += amount;
+        deposit.state = TransactionState::Resolved;
     }
 
-    fn chargeback(&mut self, input_tx: InputDepositAlterTransaction) {
-        let Some(account) = self.accounts.get_mut(&input_tx.client) else {
-            // Client doesn't exist
+    fn chargeback(&mut self, client_id: ClientId, tx_id: TransactionId) {
+        let Some(account) = self.get_unlocked_account(client_id) else {
+            return;
+        };
+        let Some(Transaction::Deposit(deposit)) = account.transactions.get_mut(&tx_id) else {
             return;
         };
 
-        let Some(stored_tx) = account.transactions.get_mut(&input_tx.tx) else {
-            return;
-        };
-
-        let Transaction::Deposit { amount, state } = stored_tx else {
-            // Withdrawals cannot be disputed
-            return;
-        };
-
-        if account.locked {
+        if !matches!(deposit.state, TransactionState::Disputed) {
             return;
         }
 
-        account.held -= *amount;
+        account.held -= deposit.amount;
         account.locked = true;
-        *state = TransactionState::ChargedBack;
+        deposit.state = TransactionState::ChargedBack;
+    }
+
+    fn get_unlocked_account(&mut self, client_id: ClientId) -> Option<&mut Account> {
+        let account = self.accounts.get_mut(&client_id)?;
+        if account.locked {
+            return None;
+        }
+        Some(account)
+    }
+}
+
+impl TryFrom<RawInputTransaction> for InputTransaction {
+    type Error = EngineError;
+    fn try_from(raw: RawInputTransaction) -> Result<Self, Self::Error> {
+        let RawInputTransaction {
+            tx_type,
+            client,
+            tx,
+            amount,
+        } = raw;
+        let ids = TransactionIds { client, tx };
+        let get_amount = || {
+            amount.ok_or_else(|| EngineError::InputValidation(format!("Deposit/Withdrawal (tx {tx}) missing amount")))
+        };
+
+        match tx_type.as_str() {
+            "deposit" => Ok(Self::Deposit(ids, get_amount()?)),
+            "withdrawal" => Ok(Self::Withdrawal(ids, get_amount()?)),
+            "dispute" => Ok(Self::Dispute(ids)),
+            "resolve" => Ok(Self::Resolve(ids)),
+            "chargeback" => Ok(Self::Chargeback(ids)),
+            _ => Err(EngineError::InputValidation(format!(
+                "Unknown transaction type: {tx_type}"
+            ))),
+        }
     }
 }
 
 fn format_decimal(value: Decimal) -> String {
-    format!("{:.4}", value.round_dp(4))
+    value.round_dp(4).normalize().to_string()
 }
 
 #[cfg(test)]
