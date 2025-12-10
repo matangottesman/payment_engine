@@ -1,10 +1,10 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     fs::File,
     io::{self, Read, Write},
     path::PathBuf,
 };
-use std::collections::HashSet;
+
 use rust_decimal::Decimal;
 use serde::Deserialize;
 use thiserror::Error;
@@ -51,23 +51,6 @@ enum TransactionState {
     ChargedBack,
 }
 
-#[derive(Debug, Error)]
-pub enum EngineError {
-    #[error("failed to read csv: {0}")]
-    Csv(#[from] csv::Error),
-    #[error("failed to open input {path:?}")]
-    OpenFile {
-        path: PathBuf,
-        #[source]
-        file_error: io::Error,
-    },
-    #[error("I/O error: {0}")]
-    Io(#[from] io::Error),
-
-    #[error("input transaction validation error: {0}")]
-    InputValidation(String),
-}
-
 #[derive(Debug)]
 enum InputTransaction {
     Deposit(TransactionIds, Decimal),
@@ -90,6 +73,22 @@ struct RawInputTransaction {
     client: ClientId,
     tx: TransactionId,
     amount: Option<Decimal>,
+}
+
+#[derive(Debug, Error)]
+pub enum EngineError {
+    #[error("failed to read csv: {0}")]
+    Csv(#[from] csv::Error),
+    #[error("failed to open input {path:?}")]
+    OpenFile {
+        path: PathBuf,
+        #[source]
+        file_error: io::Error,
+    },
+    #[error("I/O error: {0}")]
+    Io(#[from] io::Error),
+    #[error("input transaction validation error: {0}")]
+    InputValidation(String),
 }
 
 impl Account {
@@ -474,10 +473,7 @@ mod tests {
         assert_eq!(account.available, Decimal::from_str("2.0").unwrap());
         assert_eq!(account.held, Decimal::ZERO);
         assert!(!account.locked);
-        assert!(matches!(
-            account.transactions.get(&1),
-            Some(Transaction::Deposit(_))
-        ));
+        assert!(matches!(account.transactions.get(&1), Some(Transaction::Deposit(_))));
     }
 
     #[test]
@@ -524,7 +520,7 @@ mod tests {
             tx,
             amount: amount.map(|v| Decimal::from_str(v).expect("Incorrect decimal string")),
         }
-            .try_into()
-            .expect("Raw transaction failed to convert into InputTransaction")
+        .try_into()
+        .expect("Raw transaction failed to convert into InputTransaction")
     }
 }
