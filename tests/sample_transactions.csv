@@ -26,8 +26,10 @@ withdrawal,     4,      19,     0.5
 deposit,        4,      9,      1
 deposit,        5,      10,     0.75
 dispute,        5,      10,
-resolve,        5,      10,
 withdrawal,     5,      11,     0.25
+resolve,        5,      10,
+withdrawal,     5,      11,     0.5
+withdrawal,     5,      12,     0.25
 deposit,        3,      5,      1
 withdrawal,     3,      6,      2
 deposit,        3,      7,      3.5

@@ -28,6 +28,8 @@ as CSV.
   solve with this payment tracking system.
 - Duplicate transaction IDs are ignored.
 - Transactions that invalid based on existing state are ignored.
+- Withdrawals that do not have the required balance are still valid transactions to be tracked, even though they are
+  rejected.
 - Invalid or malformed CSV rows are ignored with a io::stderr log warning.
 
 ## General Improvements
@@ -37,6 +39,9 @@ as CSV.
   issues for the environment in which this program is run.
 - I've chosen to keep everything contained within a single module due to the relatively small size of the solution. As
   the solution expands, breaking things into modules based on responsibility would improve quality.
+- There are some unused variables that in a completed system probably shouldn't exist. However, I see the scope of this
+  sort of project increasing, and therefore maintaining a structure to represent previous and existing state
+  seems reasonable.
 
 ## Concurrency Considerations
 
@@ -46,7 +51,6 @@ as CSV.
   A library like DashMap shards its internal storage to allow this sort of behavior, so we could explore a similar
   solution. We could potentially get even more granular and lock on transactions instead of client accounts, but it
   depends on the full problem space and how these transactions are processed in a more real-world scenario.
-
 
 ## Testing
 

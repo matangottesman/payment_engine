@@ -198,6 +198,8 @@ impl Engine {
         };
 
         if account.available < amount {
+            // Insert transaction even if withdrawal has insufficient funds.
+            self.transaction_ids_processed.insert(tx_id);
             return;
         }
 
